@@ -2,19 +2,20 @@ import sys
 import math
 import socket
 import json
+from collections import deque
 from PySide6.QtWidgets import (QApplication, QMainWindow, QSystemTrayIcon, 
-                               QMenu, QStyle, QWidget)
+                               QMenu, QWidget)
 from PySide6.QtCore import Qt, QTimer, QPointF, QThread, Signal
-from PySide6.QtGui import QPainter, QBrush, QColor, QCursor, QAction, QIcon, QPixmap, QActionGroup
+from PySide6.QtGui import QPainter, QBrush, QColor, QAction, QIcon, QPixmap, QActionGroup, QTransform
 
 # --- 기본 설정 ---
 PORT = 8989
-GRID_SPACING = 120
-MAX_DOT_SIZE = 45
-SAFE_RADIUS = 300
-DAMPING = 0.95
+GYRO_SENSITIVITY = 40.0 
+ACCEL_SENSITIVITY = 150.0
 
-# IP 주소 가져오기
+# [수정] 줌 민감도: 가속도 변화에 민감하게 반응하도록 설정
+ZOOM_SENSITIVITY = 0.5 
+
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -27,10 +28,7 @@ def get_ip():
     return IP
 
 class UdpServerThread(QThread):
-    """
-    Flutter 앱에서 보내는 UDP JSON 데이터를 수신
-    """
-    data_received = Signal(float, float)
+    data_received = Signal(float, float, float, float, float, float)
 
     def __init__(self):
         super().__init__()
@@ -39,31 +37,31 @@ class UdpServerThread(QThread):
 
     def run(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # 0.0.0.0으로 바인딩하여 모든 IP 수신
         try:
             self.sock.bind(("0.0.0.0", PORT))
-            print(f"📡 UDP 서버 시작됨 (Port: {PORT})")
-        except Exception as e:
-            print(f"❌ 소켓 오류: {e}")
+        except Exception:
             return
 
         while self.running:
             try:
-                # 1024 바이트면 JSON 받기에 충분함
                 data, addr = self.sock.recvfrom(1024)
                 text = data.decode('utf-8').strip()
+                jd = json.loads(text)
                 
-                # JSON 파싱 {"x": 1.2, "y": -0.5}
-                json_data = json.loads(text)
-                x = float(json_data.get('x', 0.0))
-                y = float(json_data.get('y', 0.0))
-                
-                self.data_received.emit(x, y)
-                
-            except (json.JSONDecodeError, ValueError):
-                continue
-            except Exception as e:
-                print(f"Error: {e}")
+                # 소수점 2째 자리 반올림 (양자화) - 노이즈 1차 제거
+                def quantize(val):
+                    return round(float(val), 2)
+
+                self.data_received.emit(
+                    quantize(jd.get('gx', 0.0)), 
+                    quantize(jd.get('gy', 0.0)), 
+                    quantize(jd.get('gz', 0.0)),
+                    quantize(jd.get('ax', 0.0)), 
+                    quantize(jd.get('ay', 0.0)), 
+                    quantize(jd.get('az', 0.0))
+                )
+            except:
+                pass
 
     def stop(self):
         self.running = False
@@ -71,111 +69,175 @@ class UdpServerThread(QThread):
             self.sock.close()
         self.wait()
 
-# --- 메인 오버레이 윈도우 ---
 class MotionOverlay(QMainWindow):
     def __init__(self):
         super().__init__()
-        
-        # 윈도우 설정
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.WindowTransparentForInput |
-            Qt.WindowType.Tool  # 작업 표시줄 아이콘 숨김
+            Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         
-        screen_geometry = QApplication.primaryScreen().geometry()
-        self.setGeometry(screen_geometry)
-        self.width_limit = screen_geometry.width()
-        self.height_limit = screen_geometry.height()
-        
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self.width_limit = screen.width()
+        self.height_limit = screen.height()
         self.center_x = self.width_limit / 2
         self.center_y = self.height_limit / 2
-        self.max_distance = math.hypot(self.center_x, self.center_y)
+        self.diag_len = math.hypot(self.width_limit, self.height_limit)
 
-        # 변수 초기화
-        self.velocity = QPointF(0, 0)
-        self.total_offset = QPointF(0, 0)
-        self.sensitivity = 15.0  # 기본 민감도
-
-        # 보정 관련
-        self.is_calibrating = True
-        self.calibration_buffer_x = []
-        self.calibration_buffer_y = []
-        self.bias_x = 0.0
-        self.bias_y = 0.0
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.rotation_angle = 0.0 
+        self.scale_factor = 1.0
         
-        # 필터링
-        self.target_accel_x = 0.0
-        self.target_accel_y = 0.0
-        self.filtered_accel_x = 0.0
-        self.filtered_accel_y = 0.0
+        self.current_opacity = 0.0
+        self.target_opacity = 0.0
 
-        # 서버 시작
+        self.is_calibrating = True
+        self.calib_data = []
+        
+        # [핵심] 기준값(Bias) 변수
+        # 자이로(회전)는 고정된 기준값을 씁니다. (내가 멈추면 값도 0이어야 함)
+        self.bias_gy = 0.0
+        
+        # 가속도(위치/크기)는 '유동적 기준값'을 씁니다. (상황에 따라 0점이 변함)
+        # 이를 통해 폰을 떨어뜨려도 잠시 후엔 그 상태가 0점이 됩니다.
+        self.running_bias_ax = 0.0
+        self.running_bias_ay = 9.8
+        self.running_bias_az = 0.0
+        self.bias_angle = 0.0
+
+        # 이동 평균 필터 버퍼
+        self.window_size = 6
+        self.buf_ax = deque(maxlen=self.window_size)
+        self.buf_ay = deque(maxlen=self.window_size)
+        self.buf_az = deque(maxlen=self.window_size)
+        self.buf_gy = deque(maxlen=self.window_size)
+        
+        self.f_ax = 0.0
+        self.f_ay = 0.0
+        self.f_az = 0.0
+        self.f_gy = 0.0
+
         self.server = UdpServerThread()
         self.server.data_received.connect(self.on_sensor_data)
         self.server.start()
 
-        # 타이머
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_physics)
-        self.timer.start(16)
+        self.timer.start(16) 
 
     def start_calibration(self):
-        """보정 모드 재시작"""
-        self.calibration_buffer_x = []
-        self.calibration_buffer_y = []
-        self.velocity = QPointF(0, 0)
+        self.calib_data = []
         self.is_calibrating = True
-        self.update() # 화면 갱신 (텍스트 표시용)
-        print("🔄 센서 재보정 시작...")
+        self.update()
 
-    def set_sensitivity(self, value):
-        """민감도 설정"""
-        self.sensitivity = value
-        print(f"🎚️ 민감도 변경됨: {self.sensitivity}")
+    def set_gyro_sensitivity(self, value):
+        global GYRO_SENSITIVITY
+        GYRO_SENSITIVITY = value * 10.0
 
-    def on_sensor_data(self, x, y):
+    def on_sensor_data(self, gx, gy, gz, ax, ay, az):
+        # 1. 초기 보정
         if self.is_calibrating:
-            self.calibration_buffer_x.append(x)
-            self.calibration_buffer_y.append(y)
-            if len(self.calibration_buffer_x) > 50:
-                self.bias_x = sum(self.calibration_buffer_x) / len(self.calibration_buffer_x)
-                self.bias_y = sum(self.calibration_buffer_y) / len(self.calibration_buffer_y)
+            self.calib_data.append((gx, gy, gz, ax, ay, az))
+            if len(self.calib_data) > 30:
+                avgs = [sum(col) / len(col) for col in zip(*self.calib_data)]
+                
+                # 자이로 Bias는 고정 (회전 멈춤을 0으로 인식)
+                self.bias_gy = avgs[1] 
+                
+                # 가속도 Bias는 초기값 설정 후 계속 변함
+                self.running_bias_ax = avgs[3]
+                self.running_bias_ay = avgs[4]
+                self.running_bias_az = avgs[5]
+                
+                self.bias_angle = math.degrees(math.atan2(avgs[3], avgs[4]))
                 self.is_calibrating = False
                 print("✅ 보정 완료")
             return
 
-        adj_x = x - self.bias_x
-        adj_y = y - self.bias_y
+        # 2. 이동 평균 필터 (노이즈 제거)
+        self.buf_ax.append(ax)
+        self.buf_ay.append(ay)
+        self.buf_az.append(az)
+        self.buf_gy.append(gy)
 
-        deadzone = 0.03
-        if abs(adj_x) < deadzone: adj_x = 0
-        if abs(adj_y) < deadzone: adj_y = 0
-
-        self.target_accel_x = adj_x * self.sensitivity
-        self.target_accel_y = -adj_y * self.sensitivity 
+        if len(self.buf_ax) >= self.window_size:
+            self.f_ax = sum(self.buf_ax) / len(self.buf_ax)
+            self.f_ay = sum(self.buf_ay) / len(self.buf_ay)
+            self.f_az = sum(self.buf_az) / len(self.buf_az)
+            self.f_gy = sum(self.buf_gy) / len(self.buf_gy)
 
     def update_physics(self):
         if self.is_calibrating: return
 
-        alpha = 0.08
-        self.filtered_accel_x += (self.target_accel_x - self.filtered_accel_x) * alpha
-        self.filtered_accel_y += (self.target_accel_y - self.filtered_accel_y) * alpha
-        
-        current_accel = QPointF(self.filtered_accel_x, self.filtered_accel_y)
+        # === 1. 동적 Bias 업데이트 (High-Pass Filter) ===
+        # 가속도(A)의 기준점(Bias)이 현재 값(f_a)을 아주 천천히 따라갑니다.
+        # 효과: 폰을 기울인 채로 가만히 있으면, 그 상태가 새로운 0점이 됩니다.
+        # 0.02는 따라가는 속도 (값이 클수록 빨리 0점으로 돌아옴)
+        adaptation_rate = 0.02
+        self.running_bias_ax = self.running_bias_ax * (1 - adaptation_rate) + self.f_ax * adaptation_rate
+        self.running_bias_ay = self.running_bias_ay * (1 - adaptation_rate) + self.f_ay * adaptation_rate
+        self.running_bias_az = self.running_bias_az * (1 - adaptation_rate) + self.f_az * adaptation_rate
 
-        self.velocity += current_accel
-        self.velocity *= DAMPING
+        # === 2. 횡이동 (Gyro Y 적분) ===
+        # 자이로는 절대 위치가 없으므로 고정 Bias를 사용하되, 데드존을 세게 줍니다.
+        gyro_y = self.f_gy - self.bias_gy
         
-        if abs(self.velocity.x()) < 0.05 and abs(self.velocity.y()) < 0.05:
-             self.velocity = QPointF(0, 0)
+        # [수정] 데드존 강화: 0.08 미만의 회전은 무시 (멈췄을 때 흐르는 현상 방지)
+        if abs(gyro_y) < 0.08: 
+            gyro_y = 0.0
+            
+        self.pos_x += gyro_y * GYRO_SENSITIVITY
+
+        # === 3. 상하 이동 (Accel Y) ===
+        # 현재값 - 유동적 Bias (멈추면 0이 됨)
+        diff_ay = self.f_ay - self.running_bias_ay
+        if abs(diff_ay) < 0.1: diff_ay = 0.0 
+        self.pos_y = diff_ay * ACCEL_SENSITIVITY
+
+        # === 4. 화면 회전 (Roll) ===
+        current_angle = math.degrees(math.atan2(self.f_ax, self.f_ay))
         
-        self.total_offset += self.velocity
+        # 회전 기준 각도도 천천히 현재 각도를 따라가게 할지 결정해야 함.
+        # 여기서는 회전은 '절대 수평'을 유지하는 게 좋으므로 고정 Bias 유지 (오뚝이 효과)
+        angle_diff = current_angle - self.bias_angle
+        if abs(angle_diff) < 1.0: angle_diff = 0.0
+        self.rotation_angle = angle_diff * 1.2
+
+        # === 5. [수정] 스케일 (Zoom) ===
+        # 현재값 - 유동적 Bias
+        # 폰을 떨어뜨려서 Z축 가속도가 변해도, Bias가 따라가므로 diff_az는 곧 0이 됨 -> 크기 원복
+        diff_az = self.f_az - self.running_bias_az
+        
+        # 데드존 적용
+        if abs(diff_az) < 0.1: diff_az = 0.0
+
+        # 목표 스케일 계산 (기본 1.0)
+        target_scale = 1.0 + (diff_az * ZOOM_SENSITIVITY)
+        target_scale = max(0.5, min(3.0, target_scale))
+        
+        # 부드럽게 돌아가기 (Elasticity)
+        self.scale_factor += (target_scale - self.scale_factor) * 0.1
+
+        # === 6. 투명도 ===
+        motion = abs(gyro_y) + abs(diff_ay) + abs(diff_az * 2) + abs(angle_diff / 10.0)
+        
+        if motion > 0.15:
+            self.target_opacity = min(1.0, (motion - 0.15) / 0.8) + 0.2
+        else:
+            self.target_opacity = 0.0
+            
+        self.current_opacity += (self.target_opacity - self.current_opacity) * 0.1
         self.update()
 
     def paintEvent(self, event):
+        if self.current_opacity < 0.02: return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -186,46 +248,66 @@ class MotionOverlay(QMainWindow):
             font.setPointSize(24)
             font.setBold(True)
             painter.setFont(font)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, 
-                             "센서 보정 중...\n폰을 움직이지 마세요")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "보정 중...")
             return
 
-        start_x = (self.total_offset.x() % GRID_SPACING) - GRID_SPACING
-        start_y = (self.total_offset.y() % GRID_SPACING) - GRID_SPACING
+        transform = QTransform()
+        transform.translate(self.center_x, self.center_y)
+        transform.rotate(self.rotation_angle) 
+        transform.translate(-self.center_x, -self.center_y)
+        painter.setTransform(transform)
 
-        for x in range(int(start_x), self.width_limit + GRID_SPACING, GRID_SPACING):
-            for y in range(int(start_y), self.height_limit + GRID_SPACING, GRID_SPACING):
-                dist_from_center = math.hypot(x - self.center_x, y - self.center_y)
-                if dist_from_center < SAFE_RADIUS: continue 
+        grid_spacing = 130 
+        start_x = (self.pos_x % grid_spacing) - grid_spacing
+        start_y = (self.pos_y % grid_spacing) - grid_spacing
+        margin = int((self.diag_len - min(self.width_limit, self.height_limit)) / 2) + 100
+        
+        x_start = int(start_x) - margin
+        x_end = self.width_limit + margin
+        y_start = int(start_y) - margin
+        y_end = self.height_limit + margin
+        
+        safe_zone = min(self.width_limit, self.height_limit) * 0.35
+        max_d_sub_safe = (self.diag_len / 2) - safe_zone
+        
+        brush_cache = {} 
 
-                progress = (dist_from_center - SAFE_RADIUS) / (self.max_distance - SAFE_RADIUS)
-                progress = max(0.0, min(1.0, progress))
-                ratio = progress ** 1.5
+        for x in range(x_start, x_end, grid_spacing):
+            for y in range(y_start, y_end, grid_spacing):
+                dist = math.hypot(x - self.center_x, y - self.center_y)
+                if dist < safe_zone: continue
 
-                size = ratio * MAX_DOT_SIZE
-                alpha = int(ratio * 100)
+                ratio = (dist - safe_zone) / max_d_sub_safe
+                if ratio > 1.0: ratio = 1.0
+                elif ratio < 0.0: ratio = 0.0
 
-                color = QColor(200, 200, 200, alpha)
-                painter.setBrush(QBrush(color))
+                alpha = int(self.current_opacity * ratio * 180)
+                if alpha < 10: continue 
+
+                size = (6 + ratio * 8) * self.scale_factor
+
+                if alpha not in brush_cache:
+                    brush_cache[alpha] = QBrush(QColor(220, 220, 220, alpha))
+                
+                painter.setBrush(brush_cache[alpha])
                 painter.drawEllipse(QPointF(x - size/2, y - size/2), size, size)
 
     def closeEvent(self, event):
         event.ignore()
         self.hide()
 
-# --- 아이콘 생성 함수 ---
+# ... 트레이 아이콘 부분 (기존과 동일)
 def create_tray_icon_pixmap():
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QBrush(QColor(255, 105, 180))) # Hot Pink
+    painter.setBrush(QBrush(QColor(255, 105, 180)))
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawEllipse(8, 8, 48, 48)
     painter.end()
     return pixmap
 
-# --- 메인 실행부 ---
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -233,87 +315,25 @@ if __name__ == "__main__":
     window = MotionOverlay()
     window.show()
 
-    # --- 시스템 트레이 설정 ---
     tray_icon = QSystemTrayIcon(QIcon(create_tray_icon_pixmap()), app)
-    tray_icon.setToolTip("멀미 방지 오버레이")
+    tray_icon.setToolTip("Fixed World Overlay")
 
     menu = QMenu()
+    menu.addAction("0점 재설정", window.start_calibration)
     
-    # [NEW] 0. IP 정보 표시 (클릭 시 복사 기능)
-    current_ip = get_ip()
-    server_addr_str = f"{current_ip}:{PORT}"
-    
-    # 제목 스타일 (비활성화된 액션으로 제목처럼 표시)
-    action_info_title = QAction("📍 서버 주소 (클릭하여 복사):", app)
-    action_info_title.setEnabled(False) 
-    menu.addAction(action_info_title)
-
-    # 실제 IP 표시 (클릭하면 복사됨)
-    action_ip_copy = QAction(f"   {server_addr_str}", app)
-    # 아이콘 추가 (선택 사항)
-    # action_ip_copy.setIcon(app.style().standardIcon(QStyle.SP_ComputerIcon))
-    
-    def copy_ip_to_clipboard():
-        clipboard = QApplication.clipboard()
-        clipboard.setText(server_addr_str)
-        tray_icon.showMessage("주소 복사됨", f"{server_addr_str} 가 클립보드에 복사되었습니다.", QSystemTrayIcon.Information, 2000)
-
-    action_ip_copy.triggered.connect(copy_ip_to_clipboard)
-    menu.addAction(action_ip_copy)
+    s_menu = menu.addMenu("회전 민감도 설정")
+    grp = QActionGroup(app)
+    opts = [("느리게 (1.0)", 1.0), ("보통 (4.0)", 4.0), ("빠르게 (8.0)", 8.0)]
+    for nm, v in opts:
+        act = QAction(nm, app, checkable=True)
+        if v == 4.0: act.setChecked(True)
+        act.triggered.connect(lambda c, val=v: window.set_gyro_sensitivity(val))
+        grp.addAction(act)
+        s_menu.addAction(act)
 
     menu.addSeparator()
-
-    # 1. 보이기/숨기기 액션
-    action_toggle = QAction("오버레이 보이기/숨기기", app)
-    action_toggle.triggered.connect(lambda: window.hide() if window.isVisible() else window.showFullScreen())
-    menu.addAction(action_toggle)
-
-    menu.addSeparator()
-
-    # 2. 센서 재보정 액션
-    action_calib = QAction("센서 다시 보정하기", app)
-    action_calib.triggered.connect(window.start_calibration)
-    menu.addAction(action_calib)
-
-    # 3. 민감도 서브 메뉴
-    sensitivity_menu = menu.addMenu("민감도 설정")
-    sens_group = QActionGroup(app)
-
-    sens_options = [
-        ("매우 낮음 (5)", 5.0),
-        ("낮음 (10)", 10.0),
-        ("보통 (15)", 15.0),
-        ("높음 (30)", 30.0),
-        ("매우 높음 (50)", 50.0)
-    ]
-
-    for label, val in sens_options:
-        action = QAction(label, app, checkable=True)
-        if val == 15.0: action.setChecked(True)
-        action.triggered.connect(lambda checked, v=val: window.set_sensitivity(v))
-        sens_group.addAction(action)
-        sensitivity_menu.addAction(action)
-
-    menu.addSeparator()
-
-    # 4. 종료 액션
-    action_quit = QAction("종료", app)
-    def quit_app():
-        window.server.stop()
-        app.quit()
-    action_quit.triggered.connect(quit_app)
-    menu.addAction(action_quit)
-
+    menu.addAction("종료", app.quit)
     tray_icon.setContextMenu(menu)
-    
-    def on_tray_activated(reason):
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            if window.isVisible():
-                window.hide()
-            else:
-                window.showFullScreen()
-    
-    tray_icon.activated.connect(on_tray_activated)
     tray_icon.show()
 
     sys.exit(app.exec())
