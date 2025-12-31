@@ -2,8 +2,6 @@ import sys
 import math
 import socket
 import json
-import asyncio
-import websockets
 from PySide6.QtWidgets import (QApplication, QMainWindow, QSystemTrayIcon, 
                                QMenu, QStyle, QWidget)
 from PySide6.QtCore import Qt, QTimer, QPointF, QThread, Signal
@@ -28,48 +26,49 @@ def get_ip():
         s.close()
     return IP
 
-# --- WebSocket 서버 스레드 ---
-class WebSocketServerThread(QThread):
+class UdpServerThread(QThread):
+    """
+    Flutter 앱에서 보내는 UDP JSON 데이터를 수신
+    """
     data_received = Signal(float, float)
 
     def __init__(self):
         super().__init__()
-        self.loop = None
-
-    async def handle_client(self, websocket):
-        print(f"✅ 새로운 연결: {websocket.remote_address}")
-        try:
-            async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    x = float(data.get('x', 0))
-                    y = float(data.get('y', 0))
-                    self.data_received.emit(x, y)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-        except websockets.exceptions.ConnectionClosed:
-            print("❌ 연결 종료됨")
+        self.running = True
+        self.sock = None
 
     def run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        
-        async def start_server_task():
-            print(f"=========================================")
-            print(f"📡 WebSocket 서버 시작 (Port: {PORT})")
-            print(f"👉 앱 주소: ws://{get_ip()}:{PORT}")
-            print(f"=========================================")
-            async with websockets.serve(self.handle_client, "0.0.0.0", PORT, ping_interval=None):
-                await asyncio.Future()
-
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 0.0.0.0으로 바인딩하여 모든 IP 수신
         try:
-            self.loop.run_until_complete(start_server_task())
-        except RuntimeError:
-            pass
+            self.sock.bind(("0.0.0.0", PORT))
+            print(f"📡 UDP 서버 시작됨 (Port: {PORT})")
+        except Exception as e:
+            print(f"❌ 소켓 오류: {e}")
+            return
+
+        while self.running:
+            try:
+                # 1024 바이트면 JSON 받기에 충분함
+                data, addr = self.sock.recvfrom(1024)
+                text = data.decode('utf-8').strip()
+                
+                # JSON 파싱 {"x": 1.2, "y": -0.5}
+                json_data = json.loads(text)
+                x = float(json_data.get('x', 0.0))
+                y = float(json_data.get('y', 0.0))
+                
+                self.data_received.emit(x, y)
+                
+            except (json.JSONDecodeError, ValueError):
+                continue
+            except Exception as e:
+                print(f"Error: {e}")
 
     def stop(self):
-        if self.loop:
-            self.loop.call_soon_threadsafe(self.loop.stop)
+        self.running = False
+        if self.sock:
+            self.sock.close()
         self.wait()
 
 # --- 메인 오버레이 윈도우 ---
@@ -114,7 +113,7 @@ class MotionOverlay(QMainWindow):
         self.filtered_accel_y = 0.0
 
         # 서버 시작
-        self.server = WebSocketServerThread()
+        self.server = UdpServerThread()
         self.server.data_received.connect(self.on_sensor_data)
         self.server.start()
 
