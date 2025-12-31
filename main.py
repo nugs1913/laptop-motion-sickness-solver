@@ -28,7 +28,7 @@ def get_ip():
         s.close()
     return IP
 
-# --- WebSocket 서버 스레드 (수정 완료 버전) ---
+# --- WebSocket 서버 스레드 ---
 class WebSocketServerThread(QThread):
     data_received = Signal(float, float)
 
@@ -155,7 +155,6 @@ class MotionOverlay(QMainWindow):
         if abs(adj_x) < deadzone: adj_x = 0
         if abs(adj_y) < deadzone: adj_y = 0
 
-        # 설정된 민감도(self.sensitivity) 사용
         self.target_accel_x = adj_x * self.sensitivity
         self.target_accel_y = -adj_y * self.sensitivity 
 
@@ -212,17 +211,13 @@ class MotionOverlay(QMainWindow):
                 painter.drawEllipse(QPointF(x - size/2, y - size/2), size, size)
 
     def closeEvent(self, event):
-        # 창 닫기 이벤트 무시 (트레이 종료로만 꺼짐)
         event.ignore()
         self.hide()
 
 # --- 아이콘 생성 함수 ---
 def create_tray_icon_pixmap():
-    # 64x64 크기의 투명한 픽스맵 생성
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.transparent)
-    
-    # 분홍색 원 그리기
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setBrush(QBrush(QColor(255, 105, 180))) # Hot Pink
@@ -234,8 +229,6 @@ def create_tray_icon_pixmap():
 # --- 메인 실행부 ---
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
-    # 마지막 창이 닫혀도 앱이 종료되지 않도록 설정 (백그라운드 실행 필수)
     app.setQuitOnLastWindowClosed(False)
 
     window = MotionOverlay()
@@ -245,8 +238,31 @@ if __name__ == "__main__":
     tray_icon = QSystemTrayIcon(QIcon(create_tray_icon_pixmap()), app)
     tray_icon.setToolTip("멀미 방지 오버레이")
 
-    # 트레이 메뉴 생성
     menu = QMenu()
+    
+    # [NEW] 0. IP 정보 표시 (클릭 시 복사 기능)
+    current_ip = get_ip()
+    server_addr_str = f"{current_ip}:{PORT}"
+    
+    # 제목 스타일 (비활성화된 액션으로 제목처럼 표시)
+    action_info_title = QAction("📍 서버 주소 (클릭하여 복사):", app)
+    action_info_title.setEnabled(False) 
+    menu.addAction(action_info_title)
+
+    # 실제 IP 표시 (클릭하면 복사됨)
+    action_ip_copy = QAction(f"   {server_addr_str}", app)
+    # 아이콘 추가 (선택 사항)
+    # action_ip_copy.setIcon(app.style().standardIcon(QStyle.SP_ComputerIcon))
+    
+    def copy_ip_to_clipboard():
+        clipboard = QApplication.clipboard()
+        clipboard.setText(server_addr_str)
+        tray_icon.showMessage("주소 복사됨", f"{server_addr_str} 가 클립보드에 복사되었습니다.", QSystemTrayIcon.Information, 2000)
+
+    action_ip_copy.triggered.connect(copy_ip_to_clipboard)
+    menu.addAction(action_ip_copy)
+
+    menu.addSeparator()
 
     # 1. 보이기/숨기기 액션
     action_toggle = QAction("오버레이 보이기/숨기기", app)
@@ -262,9 +278,8 @@ if __name__ == "__main__":
 
     # 3. 민감도 서브 메뉴
     sensitivity_menu = menu.addMenu("민감도 설정")
-    sens_group = QActionGroup(app) # 하나만 선택되도록 그룹화
+    sens_group = QActionGroup(app)
 
-    # 민감도 옵션들 (텍스트, 값)
     sens_options = [
         ("매우 낮음 (5)", 5.0),
         ("낮음 (10)", 10.0),
@@ -275,8 +290,7 @@ if __name__ == "__main__":
 
     for label, val in sens_options:
         action = QAction(label, app, checkable=True)
-        if val == 15.0: action.setChecked(True) # 기본값 체크
-        # 클로저 문제 해결을 위해 val=val 사용
+        if val == 15.0: action.setChecked(True)
         action.triggered.connect(lambda checked, v=val: window.set_sensitivity(v))
         sens_group.addAction(action)
         sensitivity_menu.addAction(action)
@@ -286,16 +300,13 @@ if __name__ == "__main__":
     # 4. 종료 액션
     action_quit = QAction("종료", app)
     def quit_app():
-        window.server.stop() # 서버 스레드 안전 종료
+        window.server.stop()
         app.quit()
     action_quit.triggered.connect(quit_app)
     menu.addAction(action_quit)
 
-    # 메뉴를 트레이 아이콘에 설정
     tray_icon.setContextMenu(menu)
     
-    # 트레이 아이콘 클릭 시 동작 (클릭하면 메뉴 나옴)
-    # 더블 클릭하면 오버레이 토글
     def on_tray_activated(reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             if window.isVisible():
